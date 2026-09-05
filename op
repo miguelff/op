@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# op — caching shim in front of the 1Password CLI.
+#
+# Resolves op:// coordinates from ~/.op_shim/cache first and falls back to the
+# real `op` only on a miss, writing the value back so 1Password is asked once.
+# Understands the subcommands that `op run`-style tooling relies on (read, run,
+# inject, whoami, signin); everything else is passed through untouched.
+#
+# Environment:
+#   OP_SHIM_DIR       cache location (default ~/.op_shim)
+#   OP_SHIM_BYPASS=1  skip the shim entirely and exec the real op
+#   OP_SHIM_NO_CACHE  ERE; coordinates matching it are never cached
+#                     (default: anything whose vault name contains "prod")
+#   OP_SHIM_REAL_OP   explicit path to the real op binary
+set -uo pipefail
+
+SHIM_DIR="${OP_SHIM_DIR:-$HOME/.op_shim}"
+CACHE_FILE="$SHIM_DIR/cache"
+NO_CACHE_RE="${OP_SHIM_NO_CACHE:-^op://[^/]*[Pp]rod}"
+
+die() { echo "op-shim: $*" >&2; exit 1; }
+
+self_path() { python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || readlink -f "$0"; }
+
+find_real_op() {
+    if [ -n "${OP_SHIM_REAL_OP:-}" ]; then echo "$OP_SHIM_REAL_OP"; return; fi
+    local me candidate
+    me=$(self_path)
+    local IFS=:
+    for dir in $PATH; do
+        candidate="$dir/op"
+        [ -x "$candidate" ] || continue
+        [ "$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$candidate" 2>/dev/null || readlink -f "$candidate")" = "$me" ] && continue
+        echo "$candidate"; return
+    done
+    die "real 1Password CLI not found on PATH (brew install 1password-cli)"
+}
+
+REAL_OP=$(find_real_op) || exit 1
+
+ensure_cache() {
+    mkdir -p "$SHIM_DIR" && chmod 700 "$SHIM_DIR"
+    [ -f "$CACHE_FILE" ] || : > "$CACHE_FILE"
+    chmod 600 "$CACHE_FILE"
+}
+
+# Cache format: one line per coordinate, "<coordinate>\t<base64 value>".
+# Base64 keeps multi-line values (private keys) on a single line.
+cache_get() {
+    local coordinate="$1" line
+    line=$(grep -F -m1 "$coordinate	" "$CACHE_FILE" 2>/dev/null | awk -F'\t' -v c="$coordinate" '$1==c{print $2; exit}')
+    [ -n "$line" ] || return 1
+    printf '%s' "$line" | base64 -d
+}
+
+cache_put() {
+    local coordinate="$1" value="$2" encoded tmp
+    encoded=$(printf '%s' "$value" | base64 | tr -d '\n')
+    tmp=$(mktemp "$SHIM_DIR/.cache.XXXXXX")
+    { awk -F'\t' -v c="$coordinate" '$1!=c' "$CACHE_FILE"; printf '%s\t%s\n' "$coordinate" "$encoded"; } > "$tmp"
+    chmod 600 "$tmp" && mv "$tmp" "$CACHE_FILE"
+}
+
+cache_forget() {
+    local tmp
+    tmp=$(mktemp "$SHIM_DIR/.cache.XXXXXX")
+    awk -F'\t' -v c="$1" '$1!=c' "$CACHE_FILE" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$CACHE_FILE"
+}
+
+cacheable() { ! printf '%s' "$1" | grep -qE "$NO_CACHE_RE"; }
+
+resolve() {
+    local coordinate="$1" value
+    ensure_cache
+    if cacheable "$coordinate" && value=$(cache_get "$coordinate"); then
+        printf '%s' "$value"; return 0
+    fi
+    value=$("$REAL_OP" read "$coordinate") || return 1
+    cacheable "$coordinate" && cache_put "$coordinate" "$value"
+    printf '%s' "$value"
+}
+
+# ── read ─────────────────────────────────────────────────────────────────────
+cmd_read() {
+    local coordinate="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            op://*) coordinate="$arg" ;;
+            -*) exec "$REAL_OP" read "$@" ;;
+        esac
+    done
+    [ -n "$coordinate" ] || exec "$REAL_OP" read "$@"
+    local value
+    value=$(resolve "$coordinate") || exit 1
+    printf '%s\n' "$value"
+}
+
+# ── run ──────────────────────────────────────────────────────────────────────
+strip_quotes() {
+    local v="$1"
+    case "$v" in
+        \"*\") v="${v#\"}"; v="${v%\"}" ;;
+        \'*\') v="${v#\'}"; v="${v%\'}" ;;
+    esac
+    printf '%s' "$v"
+}
+
+load_env_file() {
+    local file="$1" line key value
+    [ -f "$file" ] || die "env file not found: $file"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in ''|'#'*) continue ;; esac
+        line="${line#export }"
+        key="${line%%=*}"; value="${line#*=}"
+        [ "$key" = "$line" ] && continue
+        value=$(strip_quotes "$value")
+        case "$value" in
+            op://*) value=$(resolve "$value") || die "could not resolve $key ($value)" ;;
+        esac
+        export "$key=$value"
+    done < "$file"
+}
+
+cmd_run() {
+    local env_file="" arg
+    while [ $# -gt 0 ]; do
+        arg="$1"; shift
+        case "$arg" in
+            --) break ;;
+            --env-file=*) env_file="${arg#--env-file=}" ;;
+            --env-file) env_file="$1"; shift ;;
+            --no-masking) ;;
+            *) exec "$REAL_OP" run "$arg" "$@" ;;
+        esac
+    done
+    [ -n "$env_file" ] || die "op run: --env-file is required"
+    [ $# -gt 0 ] || die "op run: no command given after --"
+    load_env_file "$env_file"
+    exec "$@"
+}
+
+# ── inject ───────────────────────────────────────────────────────────────────
+cmd_inject() {
+    [ $# -eq 0 ] || exec "$REAL_OP" inject "$@"
+    local input coordinate value
+    input=$(cat; printf x); input="${input%x}"
+    local coordinates
+    coordinates=$(printf '%s' "$input" | grep -oE 'op://[^[:space:]"'"'"'}]+' | sort -u)
+    for coordinate in $coordinates; do
+        value=$(resolve "$coordinate") || exit 1
+        input=$(REPL="$value" COORD="$coordinate" perl -pe 's/\Q$ENV{COORD}\E/$ENV{REPL}/g' <<<"$input"; printf x); input="${input%x}"
+    done
+    printf '%s' "$input"
+}
+
+# ── shim management ──────────────────────────────────────────────────────────
+cmd_shim() {
+    local action="${1:-help}"; shift || true
+    case "$action" in
+        list)   ensure_cache; cut -f1 "$CACHE_FILE" ;;
+        forget) [ $# -eq 1 ] || die "usage: op shim forget <coordinate>"
+                ensure_cache; cache_forget "$1" ;;
+        clear)  rm -f "$CACHE_FILE"; echo "cache cleared" ;;
+        path)   echo "$CACHE_FILE" ;;
+        real)   echo "$REAL_OP" ;;
+        *)      echo "usage: op shim list|forget <coordinate>|clear|path|real" >&2; exit 2 ;;
+    esac
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+[ "${OP_SHIM_BYPASS:-0}" = "1" ] && exec "$REAL_OP" "$@"
+[ $# -gt 0 ] || exec "$REAL_OP"
+
+case "$1" in
+    read)   shift; cmd_read "$@" ;;
+    run)    shift; cmd_run "$@" ;;
+    inject) shift; cmd_inject "$@" ;;
+    whoami|signin) exit 0 ;;
+    shim)   shift; cmd_shim "$@" ;;
+    *)      exec "$REAL_OP" "$@" ;;
+esac
