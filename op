@@ -10,13 +10,13 @@
 #   OP_SHIM_DIR       cache location (default ~/.op_shim)
 #   OP_SHIM_BYPASS=1  skip the shim entirely and exec the real op
 #   OP_SHIM_NO_CACHE  ERE; coordinates matching it are never cached
-#                     (default: anything whose vault name contains "prod")
+#                     (default: empty, everything is cached)
 #   OP_SHIM_REAL_OP   explicit path to the real op binary
 set -uo pipefail
 
 SHIM_DIR="${OP_SHIM_DIR:-$HOME/.op_shim}"
 CACHE_FILE="$SHIM_DIR/cache"
-NO_CACHE_RE="${OP_SHIM_NO_CACHE:-^op://[^/]*[Pp]rod}"
+NO_CACHE_RE="${OP_SHIM_NO_CACHE:-}"
 
 die() { echo "op-shim: $*" >&2; exit 1; }
 
@@ -67,7 +67,7 @@ cache_forget() {
     awk -F'\t' -v c="$1" '$1!=c' "$CACHE_FILE" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$CACHE_FILE"
 }
 
-cacheable() { ! printf '%s' "$1" | grep -qE "$NO_CACHE_RE"; }
+cacheable() { [ -z "$NO_CACHE_RE" ] || ! printf '%s' "$1" | grep -qE "$NO_CACHE_RE"; }
 
 resolve() {
     local coordinate="$1" value

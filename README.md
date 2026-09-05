@@ -27,8 +27,8 @@ Symlinks `op` into `~/.local/bin`, which must precede the real CLI (usually
 ## Cache
 
 `~/.op_shim/cache` is mode 600, one line per coordinate: `<coordinate>\t<base64 value>`.
-Coordinates matching `OP_SHIM_NO_CACHE` (default: any vault whose name contains
-`prod`) are resolved live and never written to disk.
+Everything is cached by default. Set `OP_SHIM_NO_CACHE` to an ERE to resolve
+matching coordinates live and keep them off disk, e.g. `^op://Omnia-Prod`.
 
 ```sh
 op shim list                # cached coordinates
